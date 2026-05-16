@@ -1,0 +1,57 @@
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+import os
+import time
+import logging
+
+from strands import Agent
+from strands.models import BedrockModel
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+MODEL_ID = os.environ["MODEL_ID"]
+AWS_REGION = os.environ["AWS_REGION"]
+
+model = BedrockModel(
+    model_id=MODEL_ID,
+    region_name=AWS_REGION,
+)
+
+agent = Agent(model=model)
+
+
+@app.get("/ping")
+def ping():
+    return {
+        "status": "Healthy",
+        "time_of_last_update": int(time.time())
+    }
+
+
+@app.post("/invocations")
+async def invocations(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"output": "Invalid JSON"})
+
+    prompt = body.get("prompt", "").strip()
+    session_id = body.get("session_id")
+
+    logger.info(f"[REQUEST] prompt={prompt!r}, session_id={session_id}")
+
+    if not prompt:
+        return JSONResponse(status_code=400, content={"output": "No prompt provided"})
+
+    try:
+        response = await agent.invoke_async(prompt)
+        result = str(response)
+        logger.info(f"[RESPONSE] {result!r}")
+        return {"output": result}
+
+    except Exception as e:
+        logger.error(f"Agent execution failed: {type(e).__name__}: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"output": "Error processing request"})

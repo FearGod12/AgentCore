@@ -1,0 +1,86 @@
+# ── Terraform / Terragrunt ───────────────────────────────────────────────────
+.terraform/
+.terragrunt-cache/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Local variable files — never commit. Commit *.tfvars.example instead.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# Provider lock files are intentionally tracked. If you need to skip them,
+# uncomment the next line.
+# .terraform.lock.hcl
+
+# ── Lambda build artifacts (produced by archive_file) ────────────────────────
+modules/**/function/*.zip
+modules/**/*.zip
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+
+# ── Docker build context ─────────────────────────────────────────────────────
+*.tar
+*.tar.gz
+
+# ── Secrets & credentials ────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.aws/
+credentials
+secrets.json
+
+# ── macOS ────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ── Editor / IDE ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cursor/
+
+# ── OS / temp ────────────────────────────────────────────────────────────────
+*.log
+!log-files/*.log
+*.tmp
+Thumbs.db

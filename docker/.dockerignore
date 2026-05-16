@@ -1,0 +1,17 @@
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Pycache
+**/__pycache__
+**/*.pyc
+**/*.pyo
+
+# Misc
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+push_images.sh
+runtime-test.sh
