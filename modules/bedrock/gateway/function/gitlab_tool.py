@@ -60,6 +60,12 @@ PATH_REPEAT_TTL = 600  # 10 minutes
 _project_type_cache: dict = {}
 PROJECT_TYPE_TTL = 1800  # 30 minutes
 
+# ── Completed-workflow circuit breaker ────────────────────────────────────────
+# Set by _create_gitlab_mr on success. Checked by _resolve_gitlab_project to
+# detect the model restarting a completed workflow and force it to reply instead.
+_last_completed_mr: dict | None = None
+COMPLETED_MR_TTL = 300  # 5 minutes
+
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -70,6 +76,18 @@ def _get_gitlab_token() -> str:
         _token_cache["value"]     = secret
         _token_cache["timestamp"] = now
     return _token_cache["value"]
+
+
+def _invalidate_token_cache(reason: str) -> None:
+    """
+    Force the next _get_gitlab_token() call to fetch a fresh secret. Called
+    when GitLab returns 401/403 so a rotated token doesn't cause a 5-minute
+    cached-token outage.
+    """
+    if _token_cache["value"] is not None:
+        logger.warning("token_cache_invalidated", extra={"reason": reason})
+    _token_cache["value"]     = None
+    _token_cache["timestamp"] = 0
 
 
 # ── Generic HTTP helper ───────────────────────────────────────────────────────
@@ -93,16 +111,21 @@ def _gitlab_request(method: str, path: str, body: dict | None = None) -> dict | 
             return json.loads(raw.decode("utf-8")) if raw else {}
     except urllib.error.HTTPError as e:
         body_str = e.read().decode()
-        print(f"GITLAB_HTTP_ERROR: status={e.code} path={path} body={body_str}")
-        logger.error("gitlab_http_error", extra={"status": e.code, "body": body_str, "path": path})
+        if e.code in (401, 403):
+            _invalidate_token_cache(f"http_{e.code}")
+        logger.error("gitlab_http_error", extra={
+            "status": e.code, "method": method, "path": path, "body": body_str,
+        })
         raise RuntimeError(f"GitLab API {e.code}: {body_str}")
     except urllib.error.URLError as e:
-        print(f"GITLAB_URL_ERROR: reason={e.reason} path={path}")
-        logger.error("gitlab_url_error", extra={"reason": str(e.reason), "path": path})
+        logger.error("gitlab_url_error", extra={
+            "reason": str(e.reason), "method": method, "path": path,
+        })
         raise RuntimeError(f"GitLab connection error: {e.reason}")
     except json.JSONDecodeError as e:
-        print(f"GITLAB_JSON_ERROR: error={e} path={path}")
-        logger.error("gitlab_json_error", extra={"error": str(e), "path": path})
+        logger.error("gitlab_json_error", extra={
+            "error": str(e), "method": method, "path": path,
+        })
         raise RuntimeError(f"GitLab returned invalid JSON: {e}")
 
 
@@ -229,6 +252,27 @@ def _resolve_gitlab_project(args: dict) -> dict:
     if not project_name:
         return _fatal("project_name is required.")
 
+    # Reset per-task exploration state. resolve_gitlab_project is always step 1
+    # of a new task. On a warm Lambda container _path_read_log persists from
+    # prior invocations; clearing it here prevents the repeat-read guard from
+    # blocking legitimate reads in the new task.
+
+    # Circuit breaker: if an MR was just completed and the model is calling
+    # resolve again, it has restarted the workflow instead of replying. Force stop.
+    global _last_completed_mr
+    if _last_completed_mr and time.time() - _last_completed_mr["ts"] < COMPLETED_MR_TTL:
+        completed = _last_completed_mr
+        _last_completed_mr = None  # clear so a genuine retry after user reply works
+        logger.warning("workflow_restart_blocked", extra={"branch": completed["branch"]})
+        return _fatal(
+            f"The workflow for branch '{completed['branch']}' is already complete. "
+            f"MR: {completed['mr_url']}\n"
+            f"Do NOT call any more tools. Reply to the user now with the Jira URL, "
+            f"branch name, commit SHA, and MR URL. STOP."
+        )
+
+    _path_read_log.clear()
+
     if repo_type not in VALID_REPO_TYPES:
         return _fatal(
             f"Invalid repo_type '{repo_type}'. Must be one of: {', '.join(VALID_REPO_TYPES)}. "
@@ -242,35 +286,42 @@ def _resolve_gitlab_project(args: dict) -> dict:
     candidate_path = f"{GITLAB_GROUP_PATH}/{subgroup}/{project_name}"
     encoded_path   = urllib.parse.quote(candidate_path, safe="")
 
-    print(f"RESOLVE_ATTEMPT_DIRECT: path={candidate_path} repo_type={repo_type}")
+    logger.info("resolve_attempt", extra={
+        "method": "direct", "path": candidate_path, "repo_type": repo_type,
+    })
     try:
         project = _gitlab_request("GET", f"/projects/{encoded_path}")
         _project_type_cache[project["id"]] = {"repo_type": repo_type, "ts": time.time()}
-        logger.info("project_resolved_direct", extra={
+        logger.info("project_resolved", extra={
+            "method":       "direct",
             "project_name": project["name"],
             "project_id":   project["id"],
             "repo_type":    repo_type,
         })
         return _format_project_ok(project, repo_type)
     except RuntimeError as e:
-        print(f"RESOLVE_DIRECT_FAILED: {e}")
+        logger.info("resolve_direct_failed", extra={"error": str(e)})
 
     # Second try: group search API scoped to the chosen subgroup
     scoped_group  = f"{GITLAB_GROUP_PATH}/{subgroup}"
     encoded_group = urllib.parse.quote(scoped_group, safe="")
     encoded_name  = urllib.parse.quote(project_name, safe="")
 
-    print(f"RESOLVE_ATTEMPT_SEARCH: group={scoped_group} name={project_name}")
+    logger.info("resolve_attempt", extra={
+        "method": "search", "group": scoped_group, "name": project_name,
+    })
     try:
         results = _gitlab_request(
             "GET",
             f"/groups/{encoded_group}/projects?search={encoded_name}&include_subgroups=true&per_page=10",
         )
     except RuntimeError as e:
-        print(f"RESOLVE_SEARCH_FAILED: {e}")
+        logger.error("resolve_search_failed", extra={"error": str(e)})
         return _error(str(e))
 
-    print(f"RESOLVE_SEARCH_RESULTS: count={len(results) if isinstance(results, list) else 'non-list'}")
+    logger.info("resolve_search_results", extra={
+        "count": len(results) if isinstance(results, list) else -1,
+    })
 
     if not results:
         return _fatal(
@@ -316,14 +367,14 @@ def _read_gitlab_tree(args: dict) -> dict:
         logger.warning("tree_repeat_blocked", extra={
             "project_id": project_id, "ref": ref, "path": path,
         })
-        return _ok(
-            f"You already read directory '{path or '/'}' on ref '{ref}' in this task. "
-            f"Duplicate exploration calls are forbidden — your previous response "
-            f"contained everything you need.\n\n"
-            f"Do NOT call read_gitlab_tree again for this path or any prefix of it. "
-            f"Do NOT call read_gitlab_file on the exemplar more than once. "
+        return _fatal(
+            f"DUPLICATE EXPLORATION: read_gitlab_tree was already called for "
+            f"path='{path or '/'}' ref='{ref}' in this task. "
+            f"Re-reading the same path is a workflow violation. "
+            f"You already have the directory listing — use it to generate the file. "
             f"Proceed immediately to the next workflow step "
-            f"(generate the file → create_gitlab_branch → commit_gitlab_file)."
+            f"(generate the file → create_gitlab_branch → commit_gitlab_file). "
+            f"Do not call read_gitlab_tree or read_gitlab_file again."
         )
 
     query = f"ref={urllib.parse.quote(ref)}&per_page=50"
@@ -373,10 +424,11 @@ def _read_gitlab_file(args: dict) -> dict:
         logger.warning("file_repeat_blocked", extra={
             "project_id": project_id, "ref": ref, "file_path": file_path,
         })
-        return _ok(
-            f"You already read '{file_path}' on ref '{ref}' in this task. "
-            f"You have the exemplar — do not read it again or any other "
-            f"exemplar. Generate the new file from what you already have and "
+        return _fatal(
+            f"DUPLICATE READ: read_gitlab_file was already called for "
+            f"'{file_path}' ref='{ref}' in this task. "
+            f"You already have the exemplar content — do not re-read it. "
+            f"Generate the new file from what you already have and "
             f"proceed to create_gitlab_branch → commit_gitlab_file."
         )
 
@@ -498,7 +550,6 @@ def _commit_gitlab_file(args: dict) -> dict:
         ]
         for marker in raw_tf_markers:
             if marker in content:
-                print(f"CONTENT_GUARD_TRIGGERED: marker={repr(marker)} repo_type=terraform")
                 logger.error("content_guard_triggered", extra={
                     "marker": marker, "branch": branch_name, "repo_type": repo_type,
                 })
@@ -509,7 +560,6 @@ def _commit_gitlab_file(args: dict) -> dict:
                 )
     elif repo_type == "gitops":
         if "apiVersion:" not in content or "kind:" not in content:
-            print("CONTENT_GUARD_TRIGGERED: missing K8s manifest markers repo_type=gitops")
             logger.error("content_guard_triggered", extra={
                 "marker": "missing_apiVersion_or_kind",
                 "branch": branch_name,
@@ -618,8 +668,12 @@ def _create_gitlab_mr(args: dict) -> dict:
                             f"MR URL: {existing['web_url']}\n"
                             f"Source: {branch_name} → {target_branch}\n"
                             f"State: {existing['state']}\n\n"
-                            f"Proceed immediately to step 9: call add_jira_comment with the branch name, "
-                            f"commit SHA, and this MR URL. Do not call any GitLab tools."
+                            f"TASK COMPLETE. You MUST now:\n"
+                            f"1. Call update_jira_ticket with ticket_key='{jira_key}' and status='In Progress'.\n"
+                            f"2. Call add_jira_comment ONCE with the branch and MR URL. Do not include the commit SHA.\n"
+                            f"3. Reply to the user with the summary.\n"
+                            f"4. STOP. Do not call any further tools under any circumstances.\n"
+                            f"Calling resolve_gitlab_project or any other tool after this is a workflow violation."
                         )}],
                         "isError": False,
                     }
@@ -629,6 +683,15 @@ def _create_gitlab_mr(args: dict) -> dict:
 
     logger.info("mr_created", extra={"project_id": project_id, "branch": branch_name, "mr_iid": result["iid"]})
 
+    global _last_completed_mr
+    _last_completed_mr = {
+        "project_id":  project_id,
+        "branch":      branch_name,
+        "mr_url":      result["web_url"],
+        "mr_title":    result["title"],
+        "ts":          time.time(),
+    }
+
     return {
         "content": [{"type": "text", "text": (
             f"Draft MR opened successfully.\n"
@@ -636,8 +699,12 @@ def _create_gitlab_mr(args: dict) -> dict:
             f"MR URL: {result['web_url']}\n"
             f"Source: {branch_name} → {target_branch}\n"
             f"State: {result['state']}\n\n"
-            f"Proceed immediately to step 9: call add_jira_comment with the branch name, "
-            f"commit SHA, and this MR URL. Do not call any GitLab tools."
+            f"TASK COMPLETE. You MUST now:\n"
+            f"1. Call update_jira_ticket with ticket_key='{jira_key}' and status='In Progress'.\n"
+            f"2. Call add_jira_comment ONCE with the branch and MR URL. Do not include the commit SHA.\n"
+            f"3. Reply to the user with the summary.\n"
+            f"4. STOP. Do not call any further tools under any circumstances.\n"
+            f"Calling resolve_gitlab_project or any other tool after this is a workflow violation."
         )}],
         "isError": False,
     }
@@ -656,7 +723,7 @@ TOOL_HANDLERS = {
 
 
 def lambda_handler(event, context):
-    print("RAW_EVENT:", json.dumps(event))
+    logger.debug("raw_event", extra={"event": event})
 
     tool_name, args, source = _resolve_tool_call(event)
 
@@ -674,8 +741,5 @@ def lambda_handler(event, context):
     try:
         return handler(args)
     except Exception as exc:
-        import traceback
-        print("TOOL_FAILED:", tool_name, str(exc))
-        print("TRACEBACK:",   traceback.format_exc())
-        logger.error("tool_failed", extra={"tool": tool_name, "error": str(exc)})
+        logger.exception("tool_failed", extra={"tool": tool_name, "error": str(exc)})
         return _fatal(f"Tool '{tool_name}' failed: {exc}")
