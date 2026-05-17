@@ -53,6 +53,10 @@ ENV/
 *.tar
 *.tar.gz
 
+# ── Excluded folders (kept on disk, never pushed) ────────────────────────────
+docker/
+docs/
+
 # ── Secrets & credentials ────────────────────────────────────────────────────
 .env
 .env.*
