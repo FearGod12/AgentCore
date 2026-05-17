@@ -84,3 +84,5 @@ secrets.json
 !log-files/*.log
 *.tmp
 Thumbs.db
+docker
+docs

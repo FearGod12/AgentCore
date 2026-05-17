@@ -90,6 +90,18 @@ def _get_jira_auth() -> str:
     return _jira_auth_cache["value"]
 
 
+def _invalidate_jira_auth_cache(reason: str) -> None:
+    """
+    Force the next _get_jira_auth() call to refetch the secret. Called when
+    Jira returns 401/403 so a rotated email:token doesn't cause a 5-minute
+    cached-auth outage.
+    """
+    if _jira_auth_cache["value"] is not None:
+        logger.warning("jira_auth_cache_invalidated", extra={"reason": reason})
+    _jira_auth_cache["value"]     = None
+    _jira_auth_cache["timestamp"] = 0
+
+
 # ── Generic HTTP helpers ──────────────────────────────────────────────────────
 
 def _jira_get(path: str) -> dict:
@@ -108,16 +120,26 @@ def _jira_get(path: str) -> dict:
             return data
     except urllib.error.HTTPError as e:
         body_str = e.read().decode()
-        logger.error("jira_get_http_error", extra={"status": e.code, "body": body_str, "path": path})
+        if e.code in (401, 403):
+            _invalidate_jira_auth_cache(f"http_{e.code}")
+        logger.error("jira_http_error", extra={
+            "status": e.code, "method": "GET", "path": path, "body": body_str,
+        })
         raise RuntimeError(f"Jira API error {e.code}: {body_str}")
     except urllib.error.URLError as e:
-        logger.error("jira_get_url_error", extra={"reason": str(e.reason), "path": path})
+        logger.error("jira_url_error", extra={
+            "reason": str(e.reason), "method": "GET", "path": path,
+        })
         raise RuntimeError(f"Jira connection error: {e.reason}")
     except json.JSONDecodeError as e:
-        logger.error("jira_get_json_error", extra={"error": str(e), "path": path})
+        logger.error("jira_json_error", extra={
+            "error": str(e), "method": "GET", "path": path,
+        })
         raise RuntimeError(f"Jira returned invalid JSON: {e}")
     except Exception as e:
-        logger.error("jira_get_unexpected_error", extra={"error": str(e), "type": type(e).__name__, "path": path})
+        logger.error("jira_unexpected_error", extra={
+            "error": str(e), "type": type(e).__name__, "method": "GET", "path": path,
+        })
         raise
 
 
@@ -137,16 +159,26 @@ def _jira_get_list(path: str) -> list:
             return data
     except urllib.error.HTTPError as e:
         body_str = e.read().decode()
-        logger.error("jira_get_http_error", extra={"status": e.code, "body": body_str, "path": path})
+        if e.code in (401, 403):
+            _invalidate_jira_auth_cache(f"http_{e.code}")
+        logger.error("jira_http_error", extra={
+            "status": e.code, "method": "GET_LIST", "path": path, "body": body_str,
+        })
         raise RuntimeError(f"Jira API error {e.code}: {body_str}")
     except urllib.error.URLError as e:
-        logger.error("jira_get_url_error", extra={"reason": str(e.reason), "path": path})
+        logger.error("jira_url_error", extra={
+            "reason": str(e.reason), "method": "GET_LIST", "path": path,
+        })
         raise RuntimeError(f"Jira connection error: {e.reason}")
     except json.JSONDecodeError as e:
-        logger.error("jira_get_json_error", extra={"error": str(e), "path": path})
+        logger.error("jira_json_error", extra={
+            "error": str(e), "method": "GET_LIST", "path": path,
+        })
         raise RuntimeError(f"Jira returned invalid JSON: {e}")
     except Exception as e:
-        logger.error("jira_get_unexpected_error", extra={"error": str(e), "type": type(e).__name__, "path": path})
+        logger.error("jira_unexpected_error", extra={
+            "error": str(e), "type": type(e).__name__, "method": "GET_LIST", "path": path,
+        })
         raise
 
 
@@ -165,7 +197,11 @@ def _jira_post(path: str, body: dict) -> dict:
             return json.loads(raw.decode("utf-8")) if raw else {}
     except urllib.error.HTTPError as e:
         body_str = e.read().decode()
-        logger.error("jira_post_error", extra={"status": e.code, "body": body_str, "path": path})
+        if e.code in (401, 403):
+            _invalidate_jira_auth_cache(f"http_{e.code}")
+        logger.error("jira_http_error", extra={
+            "status": e.code, "method": "POST", "path": path, "body": body_str,
+        })
         raise RuntimeError(f"Jira API error {e.code}: {body_str}")
 
 
@@ -184,7 +220,11 @@ def _jira_put(path: str, body: dict) -> dict:
             return json.loads(raw.decode("utf-8")) if raw else {}
     except urllib.error.HTTPError as e:
         body_str = e.read().decode()
-        logger.error("jira_put_error", extra={"status": e.code, "body": body_str, "path": path})
+        if e.code in (401, 403):
+            _invalidate_jira_auth_cache(f"http_{e.code}")
+        logger.error("jira_http_error", extra={
+            "status": e.code, "method": "PUT", "path": path, "body": body_str,
+        })
         raise RuntimeError(f"Jira API error {e.code}: {body_str}")
 
 
@@ -710,7 +750,7 @@ def lambda_handler(event, context):
     with inline_payload currently delivers raw arguments without tool metadata;
     we infer the tool from payload shape in that case.
     """
-    print("RAW_EVENT:", json.dumps(event))
+    logger.debug("raw_event", extra={"event": event})
 
     tool_name, args, source = _resolve_tool_call(event)
 
@@ -729,8 +769,5 @@ def lambda_handler(event, context):
     try:
         return handler(args)
     except Exception as exc:
-        import traceback
-        print("TOOL_FAILED:", tool_name, str(exc))
-        print("TRACEBACK:", traceback.format_exc())
-        logger.error("tool_failed", extra={"tool": tool_name, "error": str(exc)})
+        logger.exception("tool_failed", extra={"tool": tool_name, "error": str(exc)})
         return _error(f"Tool '{tool_name}' failed: {exc}")
